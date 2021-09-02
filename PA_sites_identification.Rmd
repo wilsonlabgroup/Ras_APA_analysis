@@ -1,0 +1,521 @@
+---
+title: "01 PAsite identification"
+author: "Huayun Hou"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output: 
+ bookdown::html_document2:
+    toc: true
+    toc_float: true
+    code_folding: hide
+---
+
+This document contains scripts used to:
+
+1. Identify polyadenylation (PA) sites from 3'UTR-seq (lexogen Quantseq) data in C. elegans.
+2. Identify differentially used PA sties between conditions and classify different alternative polyadenylation events
+3. Perform differential gene expression analysis between conditions
+4. Generate specific figures used in manuscript
+
+# Analysis setup
+
+## Source script with functions used in this analysis.
+
+```{r setup, include=TRUE, message=FALSE, warning=FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE, eval = FALSE)
+# source essential functions
+source("derfinder_ce11_utr_functions.r")
+
+outname <- "ce11"
+
+load("01_PA_site_identification.RData")
+```
+
+## Get genome information.
+
+After trimming for quality, adaptors and polyA, sequencing reads were aligned to ce11 genome, obtained from the UCSC genome browser database. Only reads with at least 5As at the end were used. Transcriptome annotation was obtained from wormbase (WBcel235).
+
+```{r getganno1, eval=FALSE}
+# code to get gene annotation from gtf file. 
+gtf_file <- "gdata/Caenorhabditis_elegans.WBcel235.85.modified.gtf.gz"
+txdb <- makeTxDbFromGFF(gtf_file,
+                        format = "gtf",
+                        dataSource = "WBcel235 transcript annotation",
+                        organism = "Caenorhabditis elegans",
+                        chrominfo = chromInfo)
+saveDb(txdb, file = "txdb.sqlite")
+
+# obtain transcript information
+alltx <- transcripts(txdb)
+
+# map transcript id and gene id
+txgenemap2 <- AnnotationDbi::select(txdb, keys=alltx$tx_name, keytype="TXNAME", columns=c("TXNAME", "GENEID"))
+txgenename <- txgenemap2$GENEID
+names(txgenename) <- txgenemap2$TXNAME
+
+# extract genomic features
+UTRs <- threeUTRsByTranscript(txdb, use.names=T)
+exons <- exonsBy(txdb, by="tx", use.names=T)
+
+last_exons <- endoapply(exons, function(x) x[length(x)])
+last_exons <- unlist(last_exons, use.names = T)
+
+fiveUTR <- fiveUTRsByTranscript(txdb, use.names=T)
+introns <- intronsByTranscript(txdb, use.names=T)
+
+save(txgenemap2, txgenename,alltx, UTRs, exons, last_exons, fiveUTR, introns, file = "celegans_genomic_annotation.RData" )
+```
+
+```{r getganno2}
+# obtain chromatin length information.
+chrominfo_file <- "gdata/ChromInfo.txt"
+chromInfo <- read.table(chrominfo_file, sep="\t", as.is = T)
+names(chromInfo) <- c("chrom", "length")
+
+# load mapping between transcript id, gene id, gene name, and gene type
+txgenemap <- readRDS("gdata/Caenorhabditis_elegans.WBcel235.85.txgenemap.rds")
+genename <- readRDS("gdata/Caenorhabditis_elegans.WBcel235.85.genenames.rds")
+genetype <- readRDS("gdata/Caenorhabditis_elegans.WBcel235.85.genetype.rds")
+
+# load genome annotations
+load("gdata/celegans_genomic_annotation.RData")
+```
+
+## load sample files and get sample information
+
+Using R package derfinder, read in signal in bigwig format. Here the bigwig files are generated from raw reads, 3' nucleotide only, no normalization has been performed. 
+
+There are a total of 18 samples. Samples are named by "SequencingID"_"strain"_"replicate".
+
+```{r getsample}
+# load sample files
+sample_dir <- "mapped_bigwig"
+files_plus_raw <- get_samplesfiles(sample_dir, "str1")
+files_neg_raw <- get_samplesfiles(sample_dir, "str2")
+
+#sample conditions
+# parse sample names to get a sample information table
+samplenames <- unname(sapply(basename(files_plus_raw), function(x) paste(unlist(strsplit(x, "_"))[c(1,7)], collapse = "_")))
+substr(samplenames, nchar(samplenames)-1, nchar(samplenames)-1) <- "_"
+sampleCondition <- cbind(sample=samplenames, transform_df_samplename(unname(samplenames), field = 2, list = F))
+# save sampleCondition object 
+saveRDS(sampleCondition, paste0(outname, "_sampleCondition.rds"))
+
+```
+
+# Identificaiton and filtering of PA sites
+
+## Identify expressed regions (read clusters)
+
+Fist, we identify all expressed regions (ERs), which are peaks with read coverage > 1 counts per million mapped reads (CPM) using R package *derfinder*. ER identificaion is performed separately for signal on the positive and negative strand, which are subsequently merged together. ERs are first extended 5bp upstream. Extended ERs within 5bps of each other are then merged. 
+
+```{r getER, results="hide", error=FALSE, message=FALSE, warning=FALSE}
+# get full coverage for all samples
+all_chroms <- chromInfo$chrom
+all_chroms <- all_chroms[all_chroms != "chrM"]
+
+fullCov_pos <- fullCoverage(files = files_plus_raw, chrs = all_chroms, verbose = FALSE)
+fullCov_neg <- fullCoverage(files = files_neg_raw, chrs = all_chroms, verbose = FALSE)
+
+totalmapped_pos <- sapply(files_plus_raw, getTotalMapped, chrs = all_chroms)
+totalmapped_neg <- sapply(files_neg_raw, getTotalMapped, chrs = all_chroms)
+
+# # Get region matrix 
+regionMat_pos <- regionMatrix(fullCov_pos, cutoff = 1, L = 1, totalMapped = totalmapped_pos, targetSize = 1000000)
+regionMat_neg <- regionMatrix(fullCov_neg, cutoff = 1, L = 1, totalMapped = totalmapped_neg, targetSize = 1000000)
+
+# First, all identified expressed regions were collapsed into one object. The strand information is assigned to the regions. 
+region_count_matrix_pos <-do.call("rbind", lapply(regionMat_pos, function(x) x$coverageMatrix))
+region_count_matrix_neg <- do.call("rbind", lapply(regionMat_neg, function(x) x$coverageMatrix))
+
+# collapse all the regions. Assign strand information to the regions
+# unlist regionMat_pos object
+region_list <- lapply(regionMat_pos, "[[", 1)
+region_pos <- unlist(GRangesList(region_list), recursive = T, use.names = T)
+strand(region_pos) <- "+"
+
+region_list_neg <- lapply(regionMat_neg, "[[", 1)
+region_neg <- unlist(GRangesList(region_list_neg), recursive = T, use.names = T)
+strand(region_neg) <- "-"
+
+# Merge the results from positive and negative strand and get a list of all regions
+regions_all_ori <- c(region_pos, region_neg)
+# extend regions by 5bps 
+regions_all_ori_extend5 <- grange_extend(regions_all_ori, upstream = 5)
+
+# merge regions within 5bp of each other
+regions_all <- GenomicRanges::reduce(regions_all_ori_extend5, min.gapwidth = 6)
+
+# rename regions
+names(regions_all) <- seq(1,length(regions_all))
+regions_all$region_name <- seq(1, length(regions_all))
+
+```
+
+A total of `r length(regions_all_ori)` ERs were originally identified. After merging, `r length(regions_all)` ERs are preserved and used in subsequent analysis. 
+
+## Initial annotation of expressed regions and filter for downstream poly-As  
+
+We first mapped each ER to genomic regions: last exons, annotated 3'UTRs, 5' UTRs, exons, and introns. 
+
+```{r anno1}
+map_to_gene_list <- lapply(list(last_exons, UTRs, exons, fiveUTR, introns), function(x) unique(from(findOverlaps(regions_all, x))))
+names(map_to_gene_list) <- c("last_exon","threeUTR", "exon", "fiveUTR", "intron")
+non_intergenic <- unique(unlist(map_to_gene_list))  
+all_regions_index <- 1:length(regions_all)
+map_to_gene_list$intergenic <- all_regions_index[!all_regions_index %in% non_intergenic]
+regions_anno_counts_plot <- as.data.frame(do.call("cbind", lapply(map_to_gene_list, function(x) ifelse(all_regions_index %in% x, 1, 0))))
+```
+
+Next, we obtained the sequences near the ending position of each ER and searched for A-rich sequences.
+
+We applied 2 filters:
+
+1. Examine 30bp up and 5bp downstream from ER end positions and look for 18-As with up to 5 mismatches
+2. Examine 10bp up/downstream from ER end positions for > 60% As 
+
+ERs are annotated as "valid" if it does not fit either filter. 
+
+```{r polyA}
+# Getting downstream sequences 
+regions_all_rev <- regions_all
+regions_all_rev <- invertStrand(regions_all_rev)
+
+### Filter 1: examine 30bp up and 5bp downstream from ER end positions
+Aseq <- strrep("A", 18)
+# obtain regions 30bp downstream and 5bp upstream from the end of identified regions. 
+downstream_regions <- promoters(regions_all_rev, upstream = 30, downstream = 5)
+downstream_regions <- invertStrand(trim(downstream_regions))
+
+# get sequences
+downstream_seq <- getSeq(BSgenome.Celegans.UCSC.ce11, downstream_regions)
+
+# Identify if there are any 18-nt As within 30bp downstream and 5bp upstream of identified regions
+polyAcounts <- vcountPattern(Aseq, downstream_seq, max.mismatch = 5)
+
+### Filter 2: Examine 10bp up/downstream from the end of identified regions.
+immediate_downstream <- promoters(regions_all_rev, upstream = 10, downstream = 5)
+immediate_downstream <- invertStrand(trim(immediate_downstream))
+#strand(immediate_downstream) <- unname(unlist(rev_strand[as.character(strand(immediate_downstream))]))
+immediate_downstream_seq <- getSeq(BSgenome.Celegans.UCSC.ce11, immediate_downstream)
+A_freq <- letterFrequency(immediate_downstream_seq, "A", as.prob = T)[,1]
+
+# attach results from different filters to the summary table 
+regions_anno_counts_plot$matchpolyA <- polyAcounts
+regions_anno_counts_plot$A_freq <- A_freq
+regions_anno_counts_plot$moreThan6A <- ifelse(regions_anno_counts_plot$A_freq >= 0.6, 1, 0)
+
+```
+
+
+## Associating non-exonic PA sites to genes.
+
+For ER that does not map to annotated exons, they might be novel PA sites that are unannotated or specific to the developmental stage/strain; or they could be mediated by internal A-rich sequences in intronic or other expresssed regions. This code section associates non-exonic ERs to corresponding genes they likely originated from. 
+
+The process is as follows:
+
+1. annotated non-exonic ERs to their nearest gene end upstream
+2. annotated non-exonic ERs to overlapping transcripts (introns)
+3. for ERs that annotated exclusively to 3kb from an upstream gene or introns, the ER is assigned to the corresponding gene
+4. for ERs that assign to different genes, if the ER is with 200bp from an transcript end, it is assigned to that gene, otherwise, it is assigned to the intronic overlapping gene
+
+```{r novelPA}
+# Getting all the ends of all annotated transcripts
+txends <- resize(alltx, width=1, fix="end")
+
+# get only regions that passed the criteria and re annotate only these regions
+valid_index <- with(regions_anno_counts_plot, which(matchpolyA == 0 & moreThan6A ==0))
+regions_all$valid <- ifelse(regions_all$region_name %in% valid_index, "yes", "no")
+
+# find novel potential 3UTRs to add to gene annotation
+# start with all valid ERs that do not map to exons
+# These would be intronic or intergenic ERs
+
+nonExon_index <- regions_all$region_name[!regions_all$region_name %in% as.character(map_to_gene_list$exon)]
+nonExon_regions <- regions_all[nonExon_index]
+
+map_to_ends <- follow(nonExon_regions, txends, select="all", ignore.strand=FALSE)
+distance_to_ends_downstream <- distance(nonExon_regions[queryHits(map_to_ends)], txends[subjectHits(map_to_ends)])
+mcols(map_to_ends)$distance <- distance_to_ends_downstream
+
+anno_ends <- reformat_anno(map_to_ends, txends, type="ends", nonExon_regions)
+anno_ends_valid <- subset(anno_ends, distance < 3000)
+
+
+# also map these non-exonic regions to introns and report their distance to the nearest exon (it could be right downstream from exons)
+map_to_tx <- findOverlaps(nonExon_regions, alltx, select="all")
+distance_to_nearst_exon <- GenomicRanges::distanceToNearest(nonExon_regions[(from(map_to_tx))], unlist(exons), select=c("arbitrary"))
+mcols(map_to_tx)$distance <- mcols(distance_to_nearst_exon)$distance
+anno_tx <- reformat_anno(map_to_tx, alltx, type="tx", nonExon_regions)
+
+# resolve ERs annotated to both introns and intergenic regions
+both_anno_same_gene <- mcols(anno_ends_valid)[, c("region_name","gene_id","gene_name", "distance")] %>% as.data.frame() %>%
+  inner_join(as.data.frame(mcols(anno_tx)[, c("region_name","gene_id", "gene_name", "distance")]), by="region_name") %>%
+  filter(gene_id.x == gene_id.y ) %>%
+  unique()
+
+both_anno_diff_genes <- mcols(anno_ends_valid)[, c("region_name","gene_id","gene_name", "distance")] %>% as.data.frame() %>%
+  inner_join(as.data.frame(mcols(anno_tx)[, c("region_name","gene_id", "gene_name", "distance")]), by="region_name") %>%
+  filter(gene_id.x != gene_id.y ) %>%
+  unique() %>%
+  mutate(assign=ifelse(distance.x < 200, "end", "tx"))
+
+anno_ends_final <- subset(anno_ends_valid, !region_name %in% subset(both_anno_diff_genes, assign=="tx")$region_name)
+anno_tx_final <- subset(anno_tx, !(region_name %in% subset(both_anno_diff_genes, assign=="end")$region_name | region_name %in% both_anno_same_gene$region_name))
+
+
+# annotate exonic regions to genes
+exon_regions <- regions_all[regions_all$region_name %in% map_to_gene_list$exon]
+map_to_exon <- findOverlaps(exon_regions, alltx, select="all")
+anno_exon <- reformat_anno(map_to_exon, alltx, type="exon", exon_regions)
+
+#merge all cases
+regions_anno <- unique(c(anno_ends_final[, c("region_name", "valid","gene_id", "type")], anno_tx_final[,c("region_name", "valid","gene_id", "type")], anno_exon[,c("region_name", "valid", "gene_id", "type")]))
+
+```
+
+In the end, out of a total of `r length(regions_all)` ERs, `r length(GenomicRanges::reduce(anno_exon))` are annotated to exons, `r length(GenomicRanges::reduce(anno_exon))` are located downstream of genes, and `r length(GenomicRanges::reduce(anno_tx_final))` are annotated to intronic regions. 
+
+## Count the number of reads mapped to each ER
+
+Next, we count the reads mapped to each ER separately for positive and negative strand for each sample. 
+
+```{r count}
+# order annotated regions by strand 
+regions_anno <- c(regions_anno[strand(regions_anno) == "+"],
+                  regions_anno[strand(regions_anno) == "-"])
+
+temp <- subset(regions_anno, strand(regions_anno) == "+") 
+plus_region_signal <- lapply(1:length(temp), function(x) get_signal(temp[x], fullCov_pos))
+plus_region_signal_df <- do.call("rbind", plus_region_signal)
+
+temp <- subset(regions_anno, strand(regions_anno) == "-")
+neg_region_signal <- lapply(1:length(temp), function(x) get_signal(temp[x], fullCov_neg))
+neg_region_signal_df <- do.call("rbind", neg_region_signal)
+rm(temp)
+
+# merge plus and minus strand.
+count_table_all <- as.data.frame(rbind(plus_region_signal_df, neg_region_signal_df))
+
+# attach counts to region annotations 
+regions_anno_withCounts <- grange_add(regions_anno, count_table_all)
+# separate regions by gene
+regions_by_gene <- split(regions_anno_withCounts, mcols(regions_anno_withCounts)$gene_id)
+
+# output all PA sites
+#regions_anno_withCounts_out <- as.data.frame(regions_anno_withCounts)
+#regions_anno_withCounts_out <- regions_anno_withCounts_out[, !colnames(regions_anno_withCounts_out) %in% c("tx_name", "gene")]
+
+```
+
+## Identify a final list of PA sites for each gene
+
+We then go through each gene. Judging if an ER if likely to be a real PA site through a set of processes.
+
+1. If the internal polyA site is the longest, or second longest followed by a real polyA site, and also has significant proportion of reads mapped, make it a valid site
+2. If majority (>75%) of the reads come from an internal A-rich sequence mediated event, discard the gene for analysis
+3. Merge regions that are within 25bp of each other
+4. Only continue with ERs that contain > 5% of all reads mapped to the gene or have > 10 reads in at least 3 samples. This gets rid of ERs that are very weakly expressed.
+5. Discard gene that have < 2 PA sites left 
+6. Order the filtered PA sites for each gene by their location and calculate percentage of proximal PA site usage (PPAU) with: reads map to the most proximal site/ reads map to this gene
+
+Finally, gene counting is performed during this process. Reads from valid ERs (PA sites) assigned to the corresponding gene is added up and saved to the "count_table" object.
+
+The PA site count table is then saved for differential PA site usage analysis with *DEXseq*.
+
+
+```{r processgene}
+# get genes that have multiple ERs annotated 
+regions_by_gene_multi <- regions_by_gene[sapply(regions_by_gene, length) > 1]
+
+# for genes with only one single ER assigned to. Other than intronic internalAs, counting all other events and making a count table
+regions_by_genes_single <- regions_by_gene[!names(regions_by_gene) %in% names(regions_by_gene_multi)]
+
+count_df_single <- unlist(regions_by_genes_single) %>%
+  as.data.frame() %>%
+  filter(!(valid == "no" & type =="tx")) %>%
+  column_to_rownames("gene_id") %>%
+  select(starts_with("WL"))
+
+ 
+# processing genes with multiple ER mapped
+index <- 0 
+count_table_gene <- matrix(, ncol = 18, nrow = length(regions_by_gene_multi))
+
+proportion_list <- lapply(regions_by_gene_multi, reformat_regions)
+
+# combine gene counts and save count table
+colnames(count_table_gene) <- colnames(count_df_single)
+row.names(count_table_gene) <- names(regions_by_gene_multi)
+count_table <- rbind(count_df_single, count_table_gene)
+colnames(count_table) <- sampleCondition$sample
+saveRDS(count_table, paste0(outname, "count_table_", Sys.Date(), ".rds"))
+
+#only_internalAs <- names(proportion_list)[which(proportion_list == "only_internalAs")]
+singlePA <- names(proportion_list)[which(proportion_list == "single PA after internalAs")]
+majorityInternalAs <- names(proportion_list)[which(proportion_list == "Majority polyAs")]
+tooFewReads <- names(proportion_list)[which(proportion_list == "Too few reads")]
+singlePAafterFilter <- names(proportion_list)[which(proportion_list == "single PA after merging and filtering for low counts")]
+
+# genes with enough valid ERs to perform DEXseq
+proportion_list_used <- proportion_list[!names(proportion_list) %in% c(singlePA, majorityInternalAs, tooFewReads, singlePAafterFilter)]
+
+
+# save PA region coordinates and names 
+named_regions <- do.call("c", lapply(proportion_list_used, "[[", 3))
+named_regions <- unlist(GRangesList(named_regions), recursive = T, use.names = F)
+saveRDS(named_regions, paste0(outname, "_named_regions_", Sys.Date(), ".rds"))
+
+temp <- unlist(regions_by_genes_single, recursive = T, use.names = F)
+all_named_regions <- c(temp, named_regions)
+saveRDS(all_named_regions, paste0(outname, "_named_regions_all.rds"))
+
+
+# save a count table for DEXseq analysis
+dexcounts_df <- do.call(rbind, unname(lapply(proportion_list_used, "[[", 2)))
+dexcounts_df <- as.data.frame(dexcounts_df)
+names(dexcounts_df) <- gsub(".", "-", names(dexcounts_df), fixed = T)
+
+saveRDS(dexcounts_df, paste0("cele_all_utrcounts_dexcounts_df.rds"))
+```
+
+In total, `r length(regions_by_gene)` genes are detected (having at least one ER map to them). Among these, `r length(proportion_list)` have more than one ERs mapped to them (including ones that may be initiated from internal A-rich sequences). After processing, `r length(proportion_list_used)` genes have >= 2 valid PA sites and are then subjected to differential PA site usage analysis. 
+
+Numbers of PA sites per gene:
+
+```{r numPAsites, eval=T}
+as.data.frame(table(sapply(proportion_list_used, function(x) length(x[[3]]))))
+```
+
+ 
+
+## generating plots to summarize PPAU
+
+```{r outputppau}
+# get a dataframe of proportion of reads mapping to shortest PA site 
+proportion_df <- do.call(rbind, lapply(proportion_list_used, "[[", 7))
+#names(proportion_df) <- gsub(".", "-", names(proportion_df), fixed=T)
+names(proportion_df) <- samplenames
+proportion_df[is.na(proportion_df)] <- 0
+temp <- proportion_df
+proportion_df$genename <- genename[row.names(proportion_df)]
+
+# output a data frame of the UTRindex 
+output <- proportion_df
+output$geneID <- row.names(output) 
+output <- output[, c("geneID", "genename", names(output)[grepl("WL", names(output))])]
+
+n2mean <- rowMeans(output[,3:5])
+cfimmean <- rowMeans(output[,12:13])
+
+difforder <- order(cfimmean - n2mean)
+write.xlsx(output[difforder,], paste0("cele_all_utrindex_df_", Sys.Date(), ".xlsx"))
+saveRDS(output,paste0("cele_all_utrindex_df_", Sys.Date(), ".rds"))
+```
+
+### boxplots showing the distribution of average PPAU across biological replicates (**Figure 3X**)
+
+```{r plot, fig.cap=c("Boxplot showing average PPAU across biological development for all strains", "Boxplot showing average PPAU across biological development for selected strains"), eval = T}
+# set factor levels of conditions
+con_order <- c("N2", "daf2", "daf16", "daf2-daf16", "cfim1", "daf2-cfim1")
+
+# set colors for different conditions
+cols <- colorRampPalette(brewer.pal(8, "RdYlBu"))(8)
+condition_cols <- cols[c(1:4, 8,6)]
+names(condition_cols) <- con_order
+
+# get UTR index data frame
+plot_proportion_df <- melt(as.matrix(temp))
+plot_proportion_df <- merge(plot_proportion_df, sampleCondition, by.x="Var2", by.y="sample", all.x=T, all.y=F) %>%
+  mutate(condition = factor(condition, levels = con_order, ordered = T)) %>%
+  arrange(condition)
+
+# reformate utr index data frame to merge replicates (taking mean)
+plot_proportion_df_mergeReps <- plot_proportion_df %>%
+  group_by(Var1, condition) %>%
+  summarize(UTRindex=mean(as.numeric(value), na.rm=T)) %>%
+  mutate(condition = factor(condition, levels = con_order))
+
+# plot
+ggplot(plot_proportion_df_mergeReps) +
+  geom_boxplot(aes(x=factor(condition, levels=con_order), y=UTRindex, fill=condition)) +
+  #geom_density(aes(x=value, color=condition))
+  scale_fill_manual(values=condition_cols) +
+  #scale_fill_brewer(palette = "RdBu") +
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=30, hjust = 1, color="black"),
+        axis.text.y=element_text(color="black"),
+        axis.title.x=element_blank()) +
+  ylab("PPAU \n(proportion of reads mapped to the most proximal PA site)")
+
+
+ggplot(subset(plot_proportion_df_mergeReps, condition %in% c("N2", "cfim1", "daf2-cfim1"))) +
+  geom_boxplot(aes(x=condition, y=UTRindex, fill=condition)) +
+  #geom_density(aes(x=value, color=condition))
+  theme_bw() +
+  theme(axis.text.x=element_text(angle=30, hjust = 1, size=14, color="black"),
+        axis.text.y=element_text(color="black", size=14),
+        axis.title.x=element_blank(),
+        axis.title.y=element_text(size=14)) +
+  ylab("Boxplot showing average PPAU across biological development for all strains") +
+    scale_fill_manual(values=condition_cols) 
+
+# test for significance
+
+strains_to_compare <- c("N2", "cfim1")
+
+get_wilcox_p <- function(strains_to_compare){
+  data1 <- subset(plot_proportion_df_mergeReps, condition == strains_to_compare[[1]])$UTRindex
+data2 <- subset(plot_proportion_df_mergeReps, condition == strains_to_compare[[2]])$UTRindex
+wilcox.test(data1, data2, alternative = "less")$p.value
+}
+
+options(scipen = 999)
+```
+
+
+We performed one-sided Wilcoxon tests using mean PPAU values between N2 and cfim1 or daf2-cfim1. The p values are as follows:
+
+-N2 vs. cfim1: `r get_wilcox_p(c("N2","cfim1"))`
+
+-N2 vs. daf2-cfim1: `r get_wilcox_p(c("N2", "daf2-cfim1"))`
+
+### heatmaps showing PPAU per gene across all samples (**Supplementary figure x**)
+
+```{r plothm, fig.cap="heatmaps showing PPAU per gene across all samples", eval=T}
+# remove extra columns
+utrdf_used <- output[, -c(1:2)]
+
+# make rownames of the anntoation column same as colnames of data
+anno_df <- sampleCondition["condition"]
+row.names(anno_df) <- as.character(colnames(utrdf_used))
+
+# reorder samples by strain
+anno_order <- do.call("rbind", lapply(c("cfim1","daf2-cfim1","N2","daf2","daf16","daf2-daf16"), function(x) subset(anno_df, condition==x)))
+utrdf_used <- utrdf_used[, row.names(anno_order)]  
+
+# plot
+utrindex_full_hm <- pheatmap(utrdf_used,
+                             cluster_cols = F,
+                             annotation_col  = anno_df,
+                             annotation_colors = condition_col_list,
+                               #color = hmcol,
+                             color = colorRampPalette(brewer.pal(9, 'Blues'))(100),
+                             #color = colorRampPalette(c("darkorange", "white", "darkmagenta") )(100),
+                             show_rownames = F,
+                             show_colnames = F,
+                             border_color = NULL)
+print(utrindex_full_hm)
+
+
+
+```
+
+```{r save}
+save.image("01_PA_site_identification.RData")
+```
+
+```{r sessioninfo, message=T, eval=T, warning=T}
+sessionInfo()
+```
+
+
